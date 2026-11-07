@@ -18,6 +18,9 @@ enum ChartMetric {
     Wind,
 }
 
+/// How often the dashboard refetches data while it is open.
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 impl ChartMetric {
     fn next(self) -> Self {
         match self {
@@ -77,6 +80,10 @@ pub struct App {
     chart_metric: ChartMetric,
     hourly_start: usize,
     spinner: usize,
+    /// A fetch is in flight while the dashboard keeps showing the old data.
+    refreshing: bool,
+    /// When due, the next tick triggers an automatic refresh (Dashboard only).
+    next_auto_refresh: Option<std::time::Instant>,
     last_updated: Option<chrono::DateTime<chrono::Local>>,
     should_quit: bool,
 }
@@ -93,21 +100,30 @@ impl App {
             chart_metric: ChartMetric::Temperature,
             hourly_start: 0,
             spinner: 0,
+            refreshing: false,
+            next_auto_refresh: None,
             last_updated: None,
             should_quit: false,
         }
     }
 
-    /// Kick off an async forecast fetch; the UI shows a spinner meanwhile.
-    fn request_forecast(&mut self, place: Place) {
+    /// Kick off an async forecast fetch *while keeping the current view*; a
+    /// spinner indicator shows that a refresh is in flight.
+    fn start_fetch(&mut self, place: Place) {
         self.place = Some(place.clone());
-        self.mode = Mode::Loading;
+        self.refreshing = true;
         let tx = self.tx.clone();
         let units = self.units;
         tokio::spawn(async move {
             let result = open_meteo::fetch_forecast(&place, units).await;
             let _ = tx.send(Msg::ForecastReady(result));
         });
+    }
+
+    /// Kick off a fetch and switch to the loading screen (startup / city choice).
+    fn request_forecast(&mut self, place: Place) {
+        self.mode = Mode::Loading;
+        self.start_fetch(place);
     }
 
     fn handle_msg(&mut self, msg: Msg) {
@@ -135,9 +151,12 @@ impl App {
                     self.forecast = Some(forecast);
                     self.hourly_start = self.compute_hourly_start();
                     self.last_updated = Some(chrono::Local::now());
+                    self.refreshing = false;
+                    self.next_auto_refresh = Some(std::time::Instant::now() + AUTO_REFRESH_INTERVAL);
                     self.mode = Mode::Dashboard;
                 }
                 Err(e) => {
+                    self.refreshing = false;
                     let city = self
                         .place
                         .as_ref()
@@ -191,16 +210,19 @@ impl App {
             KeyCode::Char('c') => self.mode = Mode::Search(SearchState::default()),
             KeyCode::Tab => self.chart_metric = self.chart_metric.next(),
             KeyCode::Char('r') => {
-                if let Some(place) = self.place.clone() {
-                    self.request_forecast(place);
+                if let (Some(place), false) = (self.place.clone(), self.refreshing) {
+                    self.start_fetch(place);
                 }
             }
             KeyCode::Char('u') => {
+                if self.refreshing {
+                    return;
+                }
                 self.units = self.units.toggle();
                 self.config.units = Some(self.units);
                 let _ = self.config.save();
                 if let Some(place) = self.place.clone() {
-                    self.request_forecast(place);
+                    self.start_fetch(place);
                 }
             }
             _ => {}
@@ -212,8 +234,8 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc if self.forecast.is_some() => self.mode = Mode::Dashboard,
             KeyCode::Char('r') => {
-                if let Some(place) = self.place.clone() {
-                    self.request_forecast(place);
+                if let (Some(place), false) = (self.place.clone(), self.refreshing) {
+                    self.start_fetch(place);
                 }
             }
             _ => {}
@@ -363,7 +385,7 @@ pub async fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                     None => break,
                 }
             }
-            _ = tick.tick() => app.spinner = app.spinner.wrapping_add(1),
+            _ = tick.tick() => app.on_tick(),
         }
         if app.should_quit {
             break;
@@ -372,3 +394,187 @@ pub async fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
 
     Ok(())
 }
+
+impl App {
+    /// Called every event-loop tick (300ms): animates the spinner and
+    /// triggers an automatic refresh when the timer is due.
+    fn on_tick(&mut self) {
+        self.spinner = self.spinner.wrapping_add(1);
+        self.maybe_auto_refresh();
+    }
+
+    /// Pure check used by tests too: should we fire an automatic refresh?
+    fn auto_refresh_due(&self) -> bool {
+        let Mode::Dashboard = &self.mode else {
+            return false;
+        };
+        self.place.is_some()
+            && !self.refreshing
+            && self
+                .next_auto_refresh
+                .is_some_and(|next| std::time::Instant::now() >= next)
+    }
+
+    fn maybe_auto_refresh(&mut self) {
+        if self.auto_refresh_due() {
+            if let Some(place) = self.place.clone() {
+                self.start_fetch(place);
+            }
+        }
+    }
+
+    /// Time left until the next automatic refresh, if one is scheduled.
+    fn next_refresh_in(&self) -> Option<Duration> {
+        self.next_auto_refresh
+            .map(|next| next.saturating_duration_since(std::time::Instant::now()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::weather::{Current, Forecast, Hourly};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::time::Instant;
+
+    fn test_place() -> Place {
+        Place {
+            name: "Paris".to_string(),
+            country: "France".to_string(),
+            admin1: None,
+            latitude: 48.85,
+            longitude: 2.35,
+        }
+    }
+
+    fn dashboard_app(next_auto_refresh: Option<Instant>) -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, Config::default(), Units::Metric);
+        app.mode = Mode::Dashboard;
+        app.place = Some(test_place());
+        app.next_auto_refresh = next_auto_refresh;
+        app
+    }
+
+    #[test]
+    fn auto_refresh_fires_when_due_on_dashboard() {
+        let due = Some(Instant::now() - AUTO_REFRESH_INTERVAL);
+        assert!(dashboard_app(due).auto_refresh_due());
+        // Just scheduled: not due yet.
+        let soon = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!dashboard_app(soon).auto_refresh_due());
+    }
+
+    #[test]
+    fn auto_refresh_requires_place_idle_and_dashboard() {
+        let due = Some(Instant::now() - AUTO_REFRESH_INTERVAL);
+
+        // No place set -> never refresh.
+        let mut app = dashboard_app(due);
+        app.place = None;
+        assert!(!app.auto_refresh_due(), "place required");
+
+        // Refresh already in flight -> no overlapping refresh.
+        let mut app = dashboard_app(due);
+        app.refreshing = true;
+        assert!(!app.auto_refresh_due(), "no overlapping refresh");
+
+        // Not on the dashboard (e.g. search popup open) -> wait until the user returns.
+        let mut app = dashboard_app(due);
+        app.mode = Mode::Search(SearchState::default());
+        assert!(!app.auto_refresh_due(), "dashboard only");
+    }
+
+    #[test]
+    fn next_refresh_in_counts_down_only_when_scheduled() {
+        let remaining = Duration::from_secs(125);
+        let scheduled = dashboard_app(Some(Instant::now() + remaining));
+        // Allow a tiny scheduling skew between `now` in the app and the test.
+        let next = scheduled.next_refresh_in().expect("scheduled");
+        assert!(next <= remaining && next >= remaining - Duration::from_secs(1));
+        assert_eq!(dashboard_app(None).next_refresh_in(), None);
+    }
+
+    // --- rendering tests (deterministic, via ratatui TestBackend) ---
+
+    fn sample_forecast() -> Forecast {
+        let time: Vec<String> = (0..24).map(|i| format!("2026-11-07T{i:02}:00")).collect();
+        Forecast {
+            current: Current {
+                time: "2026-11-07T08:00".to_string(),
+                temperature: 8.3,
+                apparent_temperature: 6.1,
+                humidity: 82,
+                code: 61,
+                wind_speed: 12.4,
+                wind_direction: 250,
+                precipitation: 1.2,
+            },
+            hourly: Hourly {
+                time,
+                temperature: (0..24).map(|i| 10.0 + i as f64 / 2.0).collect(),
+                precipitation: (0..24).map(|i| if i % 2 == 0 { 0.0 } else { 1.5 }).collect(),
+                wind_speed: (0..24).map(|i| 8.0 + i as f64 / 3.0).collect(),
+            },
+            daily: vec![],
+        }
+    }
+
+    fn render(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(110, 34)).expect("terminal");
+        terminal
+            .draw(|frame| super::ui::draw(frame, app))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect()
+    }
+
+    fn dashboard_with_metric(metric: ChartMetric, scheduled: Option<Instant>) -> App {
+        let mut app = dashboard_app(scheduled);
+        app.forecast = Some(sample_forecast());
+        app.chart_metric = metric;
+        app
+    }
+
+    #[test]
+    fn dashboard_renders_header_chart_footer() {
+        let app = dashboard_with_metric(
+            ChartMetric::Temperature,
+            Some(Instant::now() + Duration::from_secs(599)),
+        );
+        let screen = render(&app);
+        assert!(screen.contains("Paris"), "header shows the place name");
+        assert!(
+            screen.contains("hourly temperature (°C)"),
+            "chart title with metric and unit"
+        );
+        assert!(screen.contains("auto-refresh in"), "footer shows countdown");
+        assert!(screen.contains("7-day forecast"), "daily strip title");
+    }
+
+    #[test]
+    fn precipitation_renders_rain_bars_with_zero_baseline() {
+        let app = dashboard_with_metric(ChartMetric::Precipitation, None);
+        let screen = render(&app);
+        assert!(
+            screen.contains("hourly precipitation (mm)"),
+            "precipitation chart title"
+        );
+        assert!(screen.contains("0.0"), "y axis starts at zero for bars");
+        assert!(screen.contains("1.5mm"), "y axis max labelled with unit");
+    }
+
+    #[test]
+    fn wind_speed_stays_a_line_chart() {
+        let app = dashboard_with_metric(ChartMetric::Wind, None);
+        let screen = render(&app);
+        assert!(screen.contains("hourly wind speed (km/h)"));
+        assert!(screen.contains("auto-refresh: —"), "no timer scheduled");
+    }
+}
+

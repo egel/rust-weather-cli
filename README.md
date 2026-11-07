@@ -19,12 +19,15 @@ A keyboard-first **terminal weather dashboard** built with Rust and
 
 - **Current conditions** — temperature, feels-like, condition (emoji + label),
   wind speed/direction, humidity, precipitation
-- **Hourly chart** — next 24 hours of temperature / precipitation / wind speed
-  (toggle with `tab`)
+- **Hourly chart** — next 24 hours of temperature / wind speed as a line chart,
+  and precipitation rendered as **rain bars** (toggle with `tab`)
 - **7-day forecast strip** — weekday icon, high/low, precipitation probability
+- **Auto-refresh** — while open on the dashboard, data is refetched every
+  10 minutes (countdown shown in the footer)
 - **City search** — type-ahead geocoding via Open-Meteo; pick from a result list
 - **Metric ⇄ imperial units** (`°C/°F`, `km/h/mph`, `mm/in`) — persisted
 - **Last city persisted** — reopening the app shows your latest city
+
 
 ## Usage
 
@@ -81,7 +84,9 @@ src/
 
 The UI never blocks on the network: fetches run as spawned tokio tasks and
 deliver results over an `mpsc` channel; the event loop `select!`s between
-keys, fetch results, and a tick for animations.
+keys, fetch results, and a tick that drives animations and the 10-minute
+auto-refresh timer. Manual `r`/`u` refreshes keep the dashboard on screen with
+a `⟳ refreshing…` indicator in the header.
 
 ## License
 

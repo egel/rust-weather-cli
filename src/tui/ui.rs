@@ -88,6 +88,12 @@ fn draw_header(
         .get(11..16)
         .map(|time| format!(" as of {time} · {updated}"))
         .unwrap_or_else(|| format!(" {updated}"));
+    let right_title = if app.refreshing {
+        let spinner = SPINNER[app.spinner % SPINNER.len()];
+        format!("{as_of} · {spinner} refreshing…    u:units  r:refresh")
+    } else {
+        format!("{as_of}    u:units  r:refresh")
+    };
 
     let line_one = Line::from(vec![
         Span::raw(format!("{emoji} ")),
@@ -120,7 +126,7 @@ fn draw_header(
             Style::new().bold(),
         ))
         .title(
-            Line::from(format!("{as_of}    u:units  r:refresh"))
+            Line::from(right_title)
                 .right_aligned()
                 .fg(Color::DarkGray),
         );
@@ -151,15 +157,25 @@ fn draw_chart(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(index, value)| (index as f64, *value))
         .collect();
-    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let data_min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let data_max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // Rain bars grow from a zero baseline; the line charts float around their own range.
+    let (graph_type, marker, bar_style) = match app.chart_metric {
+        ChartMetric::Precipitation => (GraphType::Bar, Marker::Block, Style::new().blue()),
+        _ => (GraphType::Line, Marker::Braille, Style::new().cyan()),
+    };
+    let min = match app.chart_metric {
+        ChartMetric::Precipitation => 0.0,
+        _ => data_min,
+    };
+    let max = data_max;
     let pad = (max - min).max(1.0) * 0.15;
     let unit = app.chart_metric.unit(app.units);
 
     let dataset = Dataset::default()
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(Style::new().cyan())
+        .marker(marker)
+        .graph_type(graph_type)
+        .style(bar_style)
         .data(&points);
 
     let chart = Chart::new(vec![dataset])
@@ -212,10 +228,15 @@ fn draw_daily(frame: &mut Frame, area: Rect, forecast: &crate::weather::Forecast
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let auto = match app.next_refresh_in() {
+        Some(remaining) => format!(" · auto-refresh in {}:{}", remaining.as_secs() / 60, remaining.as_secs() % 60),
+        None => " · auto-refresh: —".to_string(),
+    };
     frame.render_widget(
         Paragraph::new(format!(
-            " q quit · c city · u units · r refresh · tab chart ({}) ",
-            app.chart_metric.title()
+            " q quit · c city · u units · r refresh · tab chart ({}){} ",
+            app.chart_metric.title(),
+            auto
         ))
         .style(Style::new().dim()),
         area,
